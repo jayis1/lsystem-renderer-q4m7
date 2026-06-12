@@ -7,31 +7,27 @@ Implements Lindenmayer Systems (L-systems) with:
   - Context-sensitive L-systems
   - Multiple rendering backends (SVG, ASCII, terminal)
   - Built-in presets for classic fractals and plant models
-  - Custom color mapping and styling
-  - Turtle graphics interpretation with 2D/3D extensions
+  - Custom color mapping, gradients, and styling
+  - Turtle graphics interpretation with 2D extensions
+  - JSON import/export of L-system definitions
+  - SVG animation (growth animation) support
+  - Perturbation/noise for organic variation
+  - Batch rendering of all presets
+  - String statistics and analysis
+  - Iteration-by-iteration growth tracking
 """
 
 from __future__ import annotations
 
 import copy
-import hashlib
+import json
 import math
 import random
-import re
+import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +38,14 @@ class RenderBackend(Enum):
     SVG = auto()
     ASCII = auto()
     TERMINAL = auto()
+
+
+class ColorMode(Enum):
+    """Determines how segments are colored."""
+    DEPTH = auto()       # Color by turtle stack depth
+    POSITION = auto()   # Color by normalized position (gradient)
+    SEGMENT_INDEX = auto()  # Color by segment order (rainbow)
+    SINGLE = auto()     # Single color for all segments
 
 
 @dataclass
@@ -67,6 +71,7 @@ class Segment:
     color: str = "#000000"
     width: float = 1.0
     depth: int = 0
+    segment_index: int = 0  # Order index for color modes
 
 
 @dataclass
@@ -89,6 +94,34 @@ class LSystemRule:
     left_context: Optional[str] = None
     right_context: Optional[str] = None
 
+    def to_dict(self) -> dict:
+        """Serialize to dictionary."""
+        d = {
+            "predecessor": self.predecessor,
+            "successor": self.successor,
+        }
+        if self.condition is not None:
+            d["condition"] = self.condition
+        if self.probability != 1.0:
+            d["probability"] = self.probability
+        if self.left_context is not None:
+            d["left_context"] = self.left_context
+        if self.right_context is not None:
+            d["right_context"] = self.right_context
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LSystemRule":
+        """Deserialize from dictionary."""
+        return cls(
+            predecessor=d["predecessor"],
+            successor=d["successor"],
+            condition=d.get("condition"),
+            probability=d.get("probability", 1.0),
+            left_context=d.get("left_context"),
+            right_context=d.get("right_context"),
+        )
+
 
 @dataclass
 class LSystemDefinition:
@@ -103,6 +136,11 @@ class LSystemDefinition:
         iterations: Default number of iterations to apply.
         line_width: Default line width for rendering.
         colors: Optional mapping from depth -> color string.
+        color_mode: How to assign colors to segments.
+        gradient: Optional (start_color, end_color) for position/segment gradients.
+        perturbation: Std deviation of random angle perturbation in degrees (0 = none).
+        step_perturbation: Std deviation of random step size perturbation (0 = none).
+        background: Background color for rendering.
     """
     name: str
     axiom: str
@@ -112,6 +150,151 @@ class LSystemDefinition:
     iterations: int = 4
     line_width: float = 1.0
     colors: Dict[int, str] = field(default_factory=dict)
+    color_mode: str = "depth"  # "depth", "position", "segment_index", "single"
+    gradient: Optional[Tuple[str, str]] = None  # (start_color, end_color)
+    perturbation: float = 0.0
+    step_perturbation: float = 0.0
+    background: str = "#ffffff"
+
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-compatible dictionary."""
+        d = {
+            "name": self.name,
+            "axiom": self.axiom,
+            "rules": [r.to_dict() for r in self.rules],
+            "angle": self.angle,
+            "step_size": self.step_size,
+            "iterations": self.iterations,
+            "line_width": self.line_width,
+        }
+        if self.colors:
+            # JSON keys must be strings
+            d["colors"] = {str(k): v for k, v in self.colors.items()}
+        d["color_mode"] = self.color_mode
+        if self.gradient:
+            d["gradient"] = list(self.gradient)
+        if self.perturbation != 0.0:
+            d["perturbation"] = self.perturbation
+        if self.step_perturbation != 0.0:
+            d["step_perturbation"] = self.step_perturbation
+        if self.background != "#ffffff":
+            d["background"] = self.background
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LSystemDefinition":
+        """Deserialize from dictionary."""
+        colors_raw = d.get("colors", {})
+        colors = {int(k): v for k, v in colors_raw.items()} if colors_raw else {}
+        gradient_raw = d.get("gradient")
+        gradient = tuple(gradient_raw) if gradient_raw else None
+        return cls(
+            name=d["name"],
+            axiom=d["axiom"],
+            rules=[LSystemRule.from_dict(r) for r in d.get("rules", [])],
+            angle=d.get("angle", 25.0),
+            step_size=d.get("step_size", 5.0),
+            iterations=d.get("iterations", 4),
+            line_width=d.get("line_width", 1.0),
+            colors=colors,
+            color_mode=d.get("color_mode", "depth"),
+            gradient=gradient,
+            perturbation=d.get("perturbation", 0.0),
+            step_perturbation=d.get("step_perturbation", 0.0),
+            background=d.get("background", "#ffffff"),
+        )
+
+    def to_json(self, path: str) -> None:
+        """Save definition to a JSON file."""
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def from_json(cls, path: str) -> "LSystemDefinition":
+        """Load definition from a JSON file."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        return cls.from_dict(data)
+
+
+# ---------------------------------------------------------------------------
+# Color utilities
+# ---------------------------------------------------------------------------
+
+def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Convert a hex color string to an (R, G, B) tuple.
+
+    Handles both '#RRGGBB' and 'RRGGBB' formats.
+    Returns (0, 0, 0) for unparseable input.
+    """
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) != 6:
+        return (0, 0, 0)
+    try:
+        return (
+            int(hex_color[0:2], 16),
+            int(hex_color[2:4], 16),
+            int(hex_color[4:6], 16),
+        )
+    except ValueError:
+        return (0, 0, 0)
+
+
+def rgb_to_hex(r: int, g: int, b: int) -> str:
+    """Convert an (R, G, B) tuple to a hex color string."""
+    return f"#{max(0, min(255, r)):02x}{max(0, min(255, g)):02x}{max(0, min(255, b)):02x}"
+
+
+def lerp_color(color1: str, color2: str, t: float) -> str:
+    """Linearly interpolate between two hex colors.
+
+    Args:
+        color1: Start color in '#RRGGBB' format.
+        color2: End color in '#RRGGBB' format.
+        t: Interpolation factor (0.0 = color1, 1.0 = color2).
+
+    Returns:
+        Interpolated color in '#RRGGBB' format.
+    """
+    t = max(0.0, min(1.0, t))
+    r1, g1, b1 = hex_to_rgb(color1)
+    r2, g2, b2 = hex_to_rgb(color2)
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return rgb_to_hex(r, g, b)
+
+
+def hsl_to_rgb(h: float, s: float, l: float) -> Tuple[int, int, int]:
+    """Convert HSL (h in [0,360], s,l in [0,1]) to RGB (0-255 each)."""
+    h = h % 360
+    s = max(0.0, min(1.0, s))
+    l = max(0.0, min(1.0, l))
+    c = (1 - abs(2 * l - 1)) * s
+    x = c * (1 - abs((h / 60) % 2 - 1))
+    m = l - c / 2
+    if h < 60:
+        r, g, b = c, x, 0
+    elif h < 120:
+        r, g, b = x, c, 0
+    elif h < 180:
+        r, g, b = 0, c, x
+    elif h < 240:
+        r, g, b = 0, x, c
+    elif h < 300:
+        r, g, b = x, 0, c
+    else:
+        r, g, b = c, 0, x
+    return (int((r + m) * 255), int((g + m) * 255), int((b + m) * 255))
+
+
+def rainbow_color(index: int, total: int) -> str:
+    """Generate a rainbow color for a segment index."""
+    if total <= 0:
+        return "#ffffff"
+    hue = (index / total) * 360
+    r, g, b = hsl_to_rgb(hue, 0.85, 0.55)
+    return rgb_to_hex(r, g, b)
 
 
 # ---------------------------------------------------------------------------
@@ -143,33 +326,65 @@ class LSystemEngine:
     def _match_context(
         self, rule: LSystemRule, symbol: str, string: str, pos: int
     ) -> bool:
-        """Check left and right context for context-sensitive rules."""
-        # Left context: check if the symbols to the left match
+        """Check left and right context for context-sensitive rules.
+
+        Context matching ignores bracket symbols [] when scanning for neighbors,
+        matching the standard L-system context-sensitive semantics.
+        """
         if rule.left_context is not None:
-            left_start = pos - len(rule.left_context)
-            if left_start < 0:
-                return False
-            left_str = string[left_start:pos]
+            # Walk left skipping brackets
+            depth = 0
+            chars_matched = 0
+            i = pos - 1
+            left_str = ""
+            while i >= 0 and chars_matched < len(rule.left_context):
+                ch = string[i]
+                if ch == "]":
+                    depth += 1
+                elif ch == "[":
+                    depth -= 1
+                    if depth < 0:
+                        depth = 0
+                elif depth == 0:
+                    left_str = ch + left_str
+                    chars_matched += 1
+                i -= 1
             if left_str != rule.left_context:
                 return False
 
-        # Right context: check if the symbols to the right match
         if rule.right_context is not None:
-            right_end = pos + 1 + len(rule.right_context)
-            if right_end > len(string):
-                return False
-            right_str = string[pos + 1 : right_end]
+            depth = 0
+            chars_matched = 0
+            i = pos + 1
+            right_str = ""
+            while i < len(string) and chars_matched < len(rule.right_context):
+                ch = string[i]
+                if ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth < 0:
+                        depth = 0
+                elif depth == 0:
+                    right_str += ch
+                    chars_matched += 1
+                i += 1
             if right_str != rule.right_context:
                 return False
 
         return True
 
     def _evaluate_condition(self, rule: LSystemRule) -> bool:
-        """Evaluate a parametric rule's condition."""
+        """Evaluate a parametric rule's condition safely."""
         if rule.condition is None:
             return True
         try:
-            return bool(eval(rule.condition, {"__builtins__": {}}, self._param_context))
+            # Restricted eval: only allow basic math operations
+            safe_builtins = {
+                "abs": abs, "min": min, "max": max,
+                "int": int, "float": float, "round": round,
+            }
+            return bool(eval(rule.condition, {"__builtins__": safe_builtins}, self._param_context))
         except Exception:
             return False
 
@@ -191,8 +406,10 @@ class LSystemEngine:
         if len(matching) == 1:
             return matching[0]
 
-        # Stochastic selection
+        # Stochastic selection using weighted sampling
         total_weight = sum(r.probability for r in matching)
+        if total_weight <= 0:
+            return matching[0]
         roll = self.rng.uniform(0, total_weight)
         cumulative = 0.0
         for rule in matching:
@@ -207,6 +424,17 @@ class LSystemEngine:
         Returns the produced string.
         """
         n = iterations if iterations is not None else self.definition.iterations
+        if n < 0:
+            raise ValueError(f"Iterations must be non-negative, got {n}")
+        if n > 50:
+            # Safety guard: warn about potentially huge strings
+            estimated_length = len(self.definition.axiom) * (max(len(r.successor) for r in self.definition.rules) if self.definition.rules else 2) ** n
+            if estimated_length > 10_000_000:
+                raise ValueError(
+                    f"Iteration {n} would produce an estimated {estimated_length:,} characters. "
+                    f"Reduce iterations or use a simpler L-system."
+                )
+
         current = self.definition.axiom
         rule_map = self._build_rule_map()
 
@@ -226,6 +454,57 @@ class LSystemEngine:
             current = "".join(next_str_parts)
 
         return current
+
+    def iterate_steps(self, iterations: Optional[int] = None) -> List[str]:
+        """Apply production rules, returning the string at each iteration step.
+
+        Useful for growth animations and debugging.
+        """
+        n = iterations if iterations is not None else self.definition.iterations
+        if n < 0:
+            raise ValueError(f"Iterations must be non-negative, got {n}")
+
+        results = [self.definition.axiom]
+        current = self.definition.axiom
+        rule_map = self._build_rule_map()
+
+        for _ in range(n):
+            next_str_parts: List[str] = []
+            for pos, symbol in enumerate(current):
+                if symbol in rule_map:
+                    rule = self._select_rule(
+                        rule_map[symbol], symbol, current, pos
+                    )
+                    if rule is not None:
+                        next_str_parts.append(rule.successor)
+                    else:
+                        next_str_parts.append(symbol)
+                else:
+                    next_str_parts.append(symbol)
+            current = "".join(next_str_parts)
+            results.append(current)
+
+        return results
+
+    @staticmethod
+    def analyze(lstring: str) -> Dict[str, Any]:
+        """Analyze an L-system string and return statistics."""
+        if not lstring:
+            return {"length": 0, "symbols": {}, "draw_symbols": 0, "unique_symbols": 0}
+
+        symbol_counts: Dict[str, int] = defaultdict(int)
+        draw_symbols = 0
+        for ch in lstring:
+            symbol_counts[ch] += 1
+            if ch in ("F", "G"):
+                draw_symbols += 1
+
+        return {
+            "length": len(lstring),
+            "symbols": dict(symbol_counts),
+            "draw_symbols": draw_symbols,
+            "unique_symbols": len(symbol_counts),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +526,6 @@ class TurtleInterpreter:
       !      — Decrement line width
       (      — Decrease step size by factor
       )      — Increase step size by factor
-      {      — Begin polygon
-      }      — End polygon
       <      — Divide step size by 2
       >      — Multiply step size by 2
     """
@@ -259,11 +536,17 @@ class TurtleInterpreter:
         step_size: float = 5.0,
         line_width: float = 1.0,
         colors: Optional[Dict[int, str]] = None,
+        perturbation: float = 0.0,
+        step_perturbation: float = 0.0,
+        seed: Optional[int] = None,
     ):
         self.initial_angle = angle
         self.initial_step_size = step_size
         self.initial_line_width = line_width
         self.colors = colors or {}
+        self.perturbation = perturbation
+        self.step_perturbation = step_perturbation
+        self.rng = random.Random(seed)
 
     def interpret(self, lstring: str) -> List[Segment]:
         """Interpret an L-system string and return a list of line segments."""
@@ -280,13 +563,25 @@ class TurtleInterpreter:
         stack: List[TurtleState] = []
         segments: List[Segment] = []
         step_factor = 0.7  # For ( and ) symbols
+        seg_index = 0
 
         for ch in lstring:
             if ch in ("F", "G"):
-                # Move forward and draw
-                rad = math.radians(state.angle)
-                new_x = state.x + state.step_size * math.cos(rad)
-                new_y = state.y + state.step_size * math.sin(rad)
+                # Apply perturbation to angle and step for organic feel
+                angle_pert = 0.0
+                step_pert_factor = 1.0
+                if self.perturbation > 0:
+                    angle_pert = self.rng.gauss(0, self.perturbation)
+                if self.step_perturbation > 0:
+                    step_pert_factor = 1.0 + self.rng.gauss(0, self.step_perturbation)
+                    step_pert_factor = max(0.5, min(1.5, step_pert_factor))
+
+                actual_angle = state.angle + angle_pert
+                actual_step = state.step_size * step_pert_factor
+
+                rad = math.radians(actual_angle)
+                new_x = state.x + actual_step * math.cos(rad)
+                new_y = state.y + actual_step * math.sin(rad)
 
                 color = self.colors.get(state.depth, state.color)
                 segments.append(
@@ -298,8 +593,10 @@ class TurtleInterpreter:
                         color=color,
                         width=state.line_width,
                         depth=state.depth,
+                        segment_index=seg_index,
                     )
                 )
+                seg_index += 1
                 state.x = new_x
                 state.y = new_y
 
@@ -353,11 +650,74 @@ class TurtleInterpreter:
 
 
 # ---------------------------------------------------------------------------
+# Color post-processing
+# ---------------------------------------------------------------------------
+
+class ColorPostProcessor:
+    """Applies color modes to segments after interpretation."""
+
+    @staticmethod
+    def apply(
+        segments: List[Segment],
+        color_mode: str = "depth",
+        colors: Optional[Dict[int, str]] = None,
+        gradient: Optional[Tuple[str, str]] = None,
+    ) -> List[Segment]:
+        """Apply the specified color mode to all segments."""
+        if not segments:
+            return segments
+
+        colors = colors or {}
+
+        if color_mode == "single":
+            base_color = colors.get(0, "#2d5016")
+            for seg in segments:
+                seg.color = base_color
+
+        elif color_mode == "depth":
+            for seg in segments:
+                seg.color = colors.get(seg.depth, seg.color)
+
+        elif color_mode == "position":
+            if gradient:
+                # Color based on normalized Y position (bottom=start, top=end)
+                ys = []
+                for seg in segments:
+                    ys.extend([seg.y1, seg.y2])
+                if ys:
+                    min_y = min(ys)
+                    max_y = max(ys)
+                    y_range = max_y - min_y if max_y != min_y else 1.0
+                    for seg in segments:
+                        mid_y = (seg.y1 + seg.y2) / 2
+                        t = (mid_y - min_y) / y_range
+                        seg.color = lerp_color(gradient[0], gradient[1], t)
+            else:
+                # Default: use depth colors
+                for seg in segments:
+                    seg.color = colors.get(seg.depth, seg.color)
+
+        elif color_mode == "segment_index":
+            total = len(segments)
+            for seg in segments:
+                seg.color = rainbow_color(seg.segment_index, total)
+
+        return segments
+
+
+# ---------------------------------------------------------------------------
 # Rendering backends
 # ---------------------------------------------------------------------------
 
 class SVGRenderer:
-    """Renders segments to an SVG file."""
+    """Renders segments to an SVG file.
+
+    Supports:
+      - Auto-scaling and centering
+      - Configurable background, margins
+      - Optional SVG animation (progressive draw)
+      - Title and metadata
+    """
 
     def __init__(
         self,
@@ -365,11 +725,13 @@ class SVGRenderer:
         height: int = 800,
         background: str = "#ffffff",
         margin: float = 20.0,
+        title: str = "",
     ):
         self.width = width
         self.height = height
         self.background = background
         self.margin = margin
+        self.title = title
 
     def _compute_bounds(self, segments: List[Segment]) -> Tuple[float, float, float, float]:
         """Compute the bounding box of all segments."""
@@ -382,9 +744,36 @@ class SVGRenderer:
             ys.extend([seg.y1, seg.y2])
         return min(xs), min(ys), max(xs), max(ys)
 
-    def render(self, segments: List[Segment], output_path: str) -> str:
-        """Render segments to an SVG file."""
+    def render(
+        self,
+        segments: List[Segment],
+        output_path: str,
+        animate: bool = False,
+        animation_duration: float = 5.0,
+    ) -> str:
+        """Render segments to an SVG file.
+
+        Args:
+            segments: List of Segment objects to render.
+            output_path: Path to write the SVG file.
+            animate: If True, add SVG animation that draws segments progressively.
+            animation_duration: Duration of animation in seconds (if animate=True).
+
+        Returns:
+            Path to the output file.
+        """
         if not segments:
+            # Write empty SVG
+            lines = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                f'<svg xmlns="http://www.w3.org/2000/svg" '
+                f'width="{self.width}" height="{self.height}" '
+                f'viewBox="0 0 {self.width} {self.height}">',
+                f'<rect width="{self.width}" height="{self.height}" fill="{self.background}"/>',
+                '</svg>',
+            ]
+            with open(output_path, "w") as f:
+                f.write("\n".join(lines))
             return output_path
 
         min_x, min_y, max_x, max_y = self._compute_bounds(segments)
@@ -407,23 +796,57 @@ class SVGRenderer:
             f'width="{self.width}" height="{self.height}" '
             f'viewBox="0 0 {self.width} {self.height}">'
         )
+        if self.title:
+            lines.append(f"<title>{self.title}</title>")
+            lines.append(f"<desc>Generated by lsystem-renderer-q4m7</desc>")
+
         lines.append(
             f'<rect width="{self.width}" height="{self.height}" '
             f'fill="{self.background}"/>'
         )
 
-        for seg in segments:
-            sx1 = (seg.x1 - min_x) * scale + offset_x
-            sy1 = self.height - ((seg.y1 - min_y) * scale + offset_y)
-            sx2 = (seg.x2 - min_x) * scale + offset_x
-            sy2 = self.height - ((seg.y2 - min_y) * scale + offset_y)
+        # Group segments by color for more compact SVG
+        if not animate:
+            color_groups: Dict[str, List[Segment]] = defaultdict(list)
+            for seg in segments:
+                color_groups[seg.color].append(seg)
 
-            lines.append(
-                f'<line x1="{sx1:.3f}" y1="{sy1:.3f}" '
-                f'x2="{sx2:.3f}" y2="{sy2:.3f}" '
-                f'stroke="{seg.color}" stroke-width="{seg.width:.2f}" '
-                f'stroke-linecap="round"/>'
-            )
+            for color, group in color_groups.items():
+                # Use first segment's width as representative (close enough for grouped)
+                width = group[0].width
+                path_parts = []
+                for seg in group:
+                    sx1 = (seg.x1 - min_x) * scale + offset_x
+                    sy1 = self.height - ((seg.y1 - min_y) * scale + offset_y)
+                    sx2 = (seg.x2 - min_x) * scale + offset_x
+                    sy2 = self.height - ((seg.y2 - min_y) * scale + offset_y)
+                    path_parts.append(f"M{sx1:.2f},{sy1:.2f} L{sx2:.2f},{sy2:.2f}")
+                path_d = " ".join(path_parts)
+                lines.append(
+                    f'<path d="{path_d}" stroke="{color}" '
+                    f'stroke-width="{width:.2f}" fill="none" '
+                    f'stroke-linecap="round" stroke-linejoin="round"/>'
+                )
+        else:
+            # Animated: each segment appears progressively
+            total = len(segments)
+            delay_per_seg = animation_duration / total
+            for i, seg in enumerate(segments):
+                sx1 = (seg.x1 - min_x) * scale + offset_x
+                sy1 = self.height - ((seg.y1 - min_y) * scale + offset_y)
+                sx2 = (seg.x2 - min_x) * scale + offset_x
+                sy2 = self.height - ((seg.y2 - min_y) * scale + offset_y)
+                begin = f"{i * delay_per_seg:.3f}s"
+                dur = f"{delay_per_seg * 3:.3f}s"
+                lines.append(
+                    f'<line x1="{sx1:.3f}" y1="{sy1:.3f}" '
+                    f'x2="{sx2:.3f}" y2="{sy2:.3f}" '
+                    f'stroke="{seg.color}" stroke-width="{seg.width:.2f}" '
+                    f'stroke-linecap="round" opacity="0">'
+                    f'<animate attributeName="opacity" from="0" to="1" '
+                    f'begin="{begin}" dur="{dur}" fill="freeze"/>'
+                    f'</line>'
+                )
 
         lines.append("</svg>")
 
@@ -434,7 +857,10 @@ class SVGRenderer:
 
 
 class ASCIIRenderer:
-    """Renders segments to ASCII art using a character grid."""
+    """Renders segments to ASCII art using a character grid.
+
+    Supports directional characters (|, -, /, \\) for better-looking output.
+    """
 
     CHAR_MAP = {
         (0, 1): "|",
@@ -486,12 +912,25 @@ class ASCIIRenderer:
             dy = y2 - y1
             steps = max(abs(dx), abs(dy), 1)
 
+            # Determine direction character
+            if steps > 0:
+                ndx = dx / steps
+                ndy = dy / steps
+                # Snap to nearest direction
+                key = (
+                    round(ndx) if abs(ndx) > 0.3 else 0,
+                    round(ndy) if abs(ndy) > 0.3 else 0,
+                )
+                char = self.CHAR_MAP.get(key, "*")
+            else:
+                char = "*"
+
             for i in range(steps + 1):
                 t = i / steps
                 px = int(x1 + dx * t)
                 py = int(y1 + dy * t)
                 if 0 <= px < self.width and 0 <= py < self.height:
-                    grid[py][px] = "*"
+                    grid[py][px] = char
 
         # Flip grid vertically (y increases upward in math, downward in text)
         lines = ["".join(row) for row in reversed(grid)]
@@ -550,6 +989,7 @@ PRESETS: Dict[str, LSystemDefinition] = {
         step_size=5.0,
         iterations=12,
         line_width=1.0,
+        color_mode="segment_index",
     ),
     "hilbert_curve": LSystemDefinition(
         name="Hilbert Curve",
@@ -562,6 +1002,7 @@ PRESETS: Dict[str, LSystemDefinition] = {
         step_size=5.0,
         iterations=5,
         line_width=1.0,
+        color_mode="segment_index",
     ),
     "plant_simple": LSystemDefinition(
         name="Simple Plant",
@@ -640,6 +1081,7 @@ PRESETS: Dict[str, LSystemDefinition] = {
         step_size=3.0,
         iterations=14,
         line_width=1.0,
+        color_mode="segment_index",
     ),
     "gosper_curve": LSystemDefinition(
         name="Gosper Curve (Flowsnake)",
@@ -652,6 +1094,60 @@ PRESETS: Dict[str, LSystemDefinition] = {
         step_size=4.0,
         iterations=4,
         line_width=1.0,
+        color_mode="segment_index",
+    ),
+    "fractal_tree": LSystemDefinition(
+        name="Fractal Tree",
+        axiom="X",
+        rules=[
+            LSystemRule("X", "F+[[X]-X]-F[-FX]+X"),
+            LSystemRule("F", "FF"),
+        ],
+        angle=25.0,
+        step_size=4.0,
+        iterations=6,
+        line_width=1.5,
+        colors={
+            0: "#5a3e1b",
+            1: "#4a6e2e",
+            2: "#3d8c3a",
+            3: "#5aae5a",
+            4: "#7acf6a",
+            5: "#9aef8a",
+            6: "#baffaa",
+        },
+    ),
+    "barnsley_fern": LSystemDefinition(
+        name="Barnsley Fern (approximation)",
+        axiom="X",
+        rules=[
+            LSystemRule("X", "F+[[X]-X]-F[-FX]+X"),
+            LSystemRule("F", "FF"),
+        ],
+        angle=25.0,
+        step_size=3.0,
+        iterations=5,
+        line_width=1.0,
+        colors={
+            0: "#1a5c1a",
+            1: "#228b22",
+            2: "#32cd32",
+            3: "#7cfc00",
+            4: "#adff2f",
+        },
+    ),
+    "cantor_dust": LSystemDefinition(
+        name="Cantor Dust",
+        axiom="F",
+        rules=[
+            LSystemRule("F", "FfF"),
+            LSystemRule("f", "fff"),
+        ],
+        angle=0.0,
+        step_size=5.0,
+        iterations=4,
+        line_width=2.0,
+        color_mode="single",
     ),
 }
 
@@ -680,8 +1176,10 @@ class LSystemRenderer:
         output: str = "output.svg",
         width: int = 800,
         height: int = 800,
-        background: str = "#ffffff",
+        background: Optional[str] = None,
         margin: float = 20.0,
+        animate: bool = False,
+        animation_duration: float = 5.0,
     ) -> str:
         """Render an L-system to the specified backend.
 
@@ -693,8 +1191,10 @@ class LSystemRenderer:
             output: Output file path.
             width: Canvas width (for SVG).
             height: Canvas height (for SVG).
-            background: Background color (for SVG).
+            background: Background color (overrides definition).
             margin: Margin around the drawing (for SVG).
+            animate: If True and backend=SVG, generate animation.
+            animation_duration: Duration of animation in seconds.
 
         Returns:
             Path to the output file.
@@ -705,13 +1205,18 @@ class LSystemRenderer:
         # Resolve definition
         if isinstance(preset_or_definition, str):
             if preset_or_definition not in PRESETS:
+                available = ", ".join(sorted(PRESETS.keys()))
                 raise ValueError(
                     f"Unknown preset '{preset_or_definition}'. "
-                    f"Available: {list(PRESETS.keys())}"
+                    f"Available presets: {available}"
                 )
             definition = copy.deepcopy(PRESETS[preset_or_definition])
         else:
             definition = copy.deepcopy(preset_or_definition)
+
+        # Override background if provided
+        if background is not None:
+            definition.background = background
 
         # Generate string
         engine = LSystemEngine(definition, seed=self.seed)
@@ -723,22 +1228,43 @@ class LSystemRenderer:
             step_size=definition.step_size,
             line_width=definition.line_width,
             colors=definition.colors,
+            perturbation=definition.perturbation,
+            step_perturbation=definition.step_perturbation,
+            seed=self.seed,
         )
         segments = interpreter.interpret(lstring)
+
+        # Apply color post-processing
+        segments = ColorPostProcessor.apply(
+            segments,
+            color_mode=definition.color_mode,
+            colors=definition.colors,
+            gradient=definition.gradient,
+        )
 
         # Render
         if backend == RenderBackend.SVG:
             renderer = SVGRenderer(
-                width=width, height=height, background=background, margin=margin
+                width=width,
+                height=height,
+                background=definition.background,
+                margin=margin,
+                title=definition.name,
             )
-            return renderer.render(segments, output)
+            return renderer.render(segments, output, animate=animate,
+                                   animation_duration=animation_duration)
         elif backend == RenderBackend.ASCII:
-            renderer = ASCIIRenderer(width=min(width // 8, 120), height=min(height // 16, 60))
-            result = renderer.render(segments, output if output.endswith(".txt") else None)
-            if not output.endswith(".txt"):
-                with open(output, "w") as f:
-                    f.write(result)
-            return output
+            renderer = ASCIIRenderer(
+                width=min(width // 8, 120),
+                height=min(height // 16, 60)
+            )
+            result = renderer.render(segments)
+            actual_output = output
+            if not actual_output.endswith(".txt"):
+                actual_output = actual_output.rsplit(".", 1)[0] + ".txt"
+            with open(actual_output, "w") as f:
+                f.write(result)
+            return actual_output
         elif backend == RenderBackend.TERMINAL:
             renderer = ASCIIRenderer(width=80, height=40)
             result = renderer.render(segments)
@@ -747,6 +1273,95 @@ class LSystemRenderer:
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
+    def render_all_presets(
+        self,
+        output_dir: str = ".",
+        iterations: Optional[int] = None,
+        backend: str = "svg",
+        width: int = 800,
+        height: int = 800,
+    ) -> Dict[str, str]:
+        """Render all presets to files in the given directory.
+
+        Returns a dict mapping preset name -> output file path.
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        results = {}
+        for name in self.list_presets():
+            definition = self.get_preset(name)
+            ext = "svg" if backend == "svg" else "txt"
+            output_path = os.path.join(output_dir, f"{name}.{ext}")
+            try:
+                path = self.render(
+                    definition,
+                    iterations=iterations,
+                    backend=backend,
+                    output=output_path,
+                    width=width,
+                    height=height,
+                )
+                results[name] = path
+            except Exception as e:
+                results[name] = f"ERROR: {e}"
+        return results
+
+    def animate_growth(
+        self,
+        preset_or_definition: Union[str, LSystemDefinition],
+        output_dir: str = ".",
+        iterations: Optional[int] = None,
+        width: int = 800,
+        height: int = 800,
+    ) -> List[str]:
+        """Render each iteration step as a separate SVG file.
+
+        Creates files named step_0.svg, step_1.svg, etc.
+        Useful for creating growth animations.
+
+        Returns list of output file paths.
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+
+        if isinstance(preset_or_definition, str):
+            definition = self.get_preset(preset_or_definition)
+        else:
+            definition = copy.deepcopy(preset_or_definition)
+
+        engine = LSystemEngine(definition, seed=self.seed)
+        steps = engine.iterate_steps(iterations)
+
+        paths = []
+        for i, lstring in enumerate(steps):
+            interpreter = TurtleInterpreter(
+                angle=definition.angle,
+                step_size=definition.step_size,
+                line_width=definition.line_width,
+                colors=definition.colors,
+                perturbation=definition.perturbation,
+                step_perturbation=definition.step_perturbation,
+                seed=self.seed,
+            )
+            segments = interpreter.interpret(lstring)
+            segments = ColorPostProcessor.apply(
+                segments,
+                color_mode=definition.color_mode,
+                colors=definition.colors,
+                gradient=definition.gradient,
+            )
+
+            svg_renderer = SVGRenderer(
+                width=width, height=height,
+                background=definition.background,
+                title=f"{definition.name} — Step {i}",
+            )
+            path = os.path.join(output_dir, f"step_{i}.svg")
+            svg_renderer.render(segments, path)
+            paths.append(path)
+
+        return paths
+
     def list_presets(self) -> List[str]:
         """Return a list of available preset names."""
         return list(PRESETS.keys())
@@ -754,7 +1369,8 @@ class LSystemRenderer:
     def get_preset(self, name: str) -> LSystemDefinition:
         """Return a copy of a preset definition."""
         if name not in PRESETS:
-            raise ValueError(f"Unknown preset '{name}'")
+            available = ", ".join(sorted(PRESETS.keys()))
+            raise ValueError(f"Unknown preset '{name}'. Available: {available}")
         return copy.deepcopy(PRESETS[name])
 
 
@@ -765,7 +1381,7 @@ class LSystemRenderer:
 def main():
     """Command-line interface for the L-system renderer."""
     import argparse
-    import sys
+    import os
 
     parser = argparse.ArgumentParser(
         description="L-System Renderer — Generate fractals and plant-like structures",
@@ -781,8 +1397,20 @@ Examples:
   # Render to ASCII
   python3 lsystem.py --preset dragon_curve -i 10 --backend ascii -o dragon.txt
 
+  # Render all presets
+  python3 lsystem.py --render-all -d ./output
+
+  # Animate growth steps
+  python3 lsystem.py --preset koch_snowflake --animate -d ./growth
+
   # List available presets
   python3 lsystem.py --list-presets
+
+  # Custom L-system (Sierpinski arrowhead)
+  python3 lsystem.py --axiom "A" --rule "A->B-A-B" --rule "B->A+B+A" --angle 60 -i 7 -o custom.svg
+
+  # Load from JSON definition
+  python3 lsystem.py --load definition.json -o output.svg
         """,
     )
 
@@ -821,8 +1449,8 @@ Examples:
     )
     parser.add_argument(
         "--background",
-        default="#ffffff",
-        help="Background color (default: #ffffff)",
+        default=None,
+        help="Background color (overrides preset default)",
     )
     parser.add_argument(
         "--seed", "-s",
@@ -850,6 +1478,67 @@ Examples:
         default=None,
         help="Custom angle in degrees (overrides preset)",
     )
+    parser.add_argument(
+        "--step-size",
+        type=float,
+        default=None,
+        help="Custom step size (overrides preset)",
+    )
+    parser.add_argument(
+        "--line-width",
+        type=float,
+        default=None,
+        help="Custom line width (overrides preset)",
+    )
+    parser.add_argument(
+        "--color-mode",
+        choices=["depth", "position", "segment_index", "single"],
+        default=None,
+        help="Color mode for rendering",
+    )
+    parser.add_argument(
+        "--gradient",
+        help="Gradient colors as 'start_color,end_color' (e.g. '#ff0000,#0000ff')",
+    )
+    parser.add_argument(
+        "--perturbation",
+        type=float,
+        default=None,
+        help="Angle perturbation (std dev in degrees) for organic variation",
+    )
+    parser.add_argument(
+        "--render-all",
+        action="store_true",
+        help="Render all presets to output directory",
+    )
+    parser.add_argument(
+        "--animate",
+        action="store_true",
+        help="Generate SVG animation (progressive draw)",
+    )
+    parser.add_argument(
+        "--animate-steps",
+        action="store_true",
+        help="Render each iteration step as a separate SVG file",
+    )
+    parser.add_argument(
+        "--directory", "-d",
+        default=".",
+        help="Output directory for --render-all and --animate-steps",
+    )
+    parser.add_argument(
+        "--load",
+        help="Load L-system definition from a JSON file",
+    )
+    parser.add_argument(
+        "--save",
+        help="Save the resolved L-system definition to a JSON file (don't render)",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print string statistics without rendering",
+    )
 
     args = parser.parse_args()
 
@@ -862,30 +1551,60 @@ Examples:
             print(f"  {name:25s} — {preset.name}")
         return
 
-    if not args.preset and not args.axiom:
-        parser.error("Either --preset or --axiom with --rule is required")
+    # Render all presets — no definition needed
+    if args.render_all:
+        results = renderer.render_all_presets(
+            output_dir=args.directory,
+            iterations=args.iterations,
+            backend=args.backend,
+            width=args.width,
+            height=args.height,
+        )
+        print("Rendered all presets:")
+        for name, path in results.items():
+            print(f"  {name}: {path}")
+        return
 
-    # Build or get definition
-    if args.preset:
+    # Load from JSON or build definition
+    if args.load:
+        definition = LSystemDefinition.from_json(args.load)
+    elif args.preset:
         definition = renderer.get_preset(args.preset)
-    else:
+    elif args.axiom:
         definition = LSystemDefinition(
             name="Custom",
-            axiom=args.axiom or "F",
+            axiom=args.axiom,
             rules=[],
             angle=args.angle or 90.0,
-            step_size=5.0,
+            step_size=args.step_size or 5.0,
             iterations=4,
+            line_width=args.line_width or 1.0,
         )
+    else:
+        parser.error("One of --preset, --axiom, or --load is required "
+                     "(unless using --list-presets or --render-all)")
 
-    # Override angle if specified
+    # Apply CLI overrides
     if args.angle is not None:
         definition.angle = args.angle
+    if args.step_size is not None:
+        definition.step_size = args.step_size
+    if args.line_width is not None:
+        definition.line_width = args.line_width
+    if args.color_mode is not None:
+        definition.color_mode = args.color_mode
+    if args.gradient is not None:
+        parts = args.gradient.split(",")
+        if len(parts) == 2:
+            definition.gradient = (parts[0].strip(), parts[1].strip())
+    if args.perturbation is not None:
+        definition.perturbation = args.perturbation
+    if args.background is not None:
+        definition.background = args.background
 
     # Add custom rules
     if args.rule:
         for rule_str in args.rule:
-            # Support format: PREDECESSOR->SUCCESSOR or PREDECESSOR=SUCCESSOR
             sep = "->" if "->" in rule_str else "="
             parts = rule_str.split(sep, 1)
             if len(parts) != 2:
@@ -895,10 +1614,49 @@ Examples:
                 LSystemRule(predecessor=parts[0].strip(), successor=parts[1].strip())
             )
 
-    # Determine output path
+    # Save definition if requested
+    if args.save:
+        definition.to_json(args.save)
+        print(f"Definition saved to: {args.save}")
+        return
+
+    # Stats mode
+    if args.stats:
+        engine = LSystemEngine(definition, seed=args.seed)
+        lstring = engine.iterate(args.iterations)
+        stats = LSystemEngine.analyze(lstring)
+        print(f"L-System: {definition.name}")
+        print(f"  Axiom: {definition.axiom[:60]}{'...' if len(definition.axiom) > 60 else ''}")
+        print(f"  String length: {stats['length']:,}")
+        print(f"  Drawing symbols (F/G): {stats['draw_symbols']:,}")
+        print(f"  Unique symbols: {stats['unique_symbols']}")
+        print(f"  Symbol breakdown:")
+        # Sort by count descending
+        for sym, count in sorted(stats['symbols'].items(), key=lambda x: -x[1])[:15]:
+            pct = 100 * count / stats['length'] if stats['length'] > 0 else 0
+            print(f"    '{sym}': {count:,} ({pct:.1f}%)")
+        if stats['length'] > 15 * 1000:
+            print("  (showing top 15 symbols)")
+        return
+
+    # Animate steps
+    if args.animate_steps:
+        paths = renderer.animate_growth(
+            definition,
+            output_dir=args.directory,
+            iterations=args.iterations,
+            width=args.width,
+            height=args.height,
+        )
+        print(f"Generated {len(paths)} step files:")
+        for path in paths:
+            print(f"  {path}")
+        return
+
+    # Normal render
     output = args.output
     if args.backend == "ascii" and not output.endswith(".txt"):
-        output = output.replace(".svg", ".txt") if output.endswith(".svg") else output + ".txt"
+        output = output.rsplit(".", 1)[0] + ".txt" if "." in output else output + ".txt"
     elif args.backend == "svg" and not output.endswith(".svg"):
         output += ".svg"
 
@@ -910,8 +1668,15 @@ Examples:
         width=args.width,
         height=args.height,
         background=args.background,
+        animate=args.animate,
     )
     print(f"Output written to: {result}")
+
+    # Print brief stats
+    engine = LSystemEngine(definition, seed=args.seed)
+    lstring = engine.iterate(args.iterations)
+    stats = LSystemEngine.analyze(lstring)
+    print(f"Segments: {stats['draw_symbols']:,} | String length: {stats['length']:,}")
 
 
 if __name__ == "__main__":
