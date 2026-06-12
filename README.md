@@ -217,6 +217,45 @@ lsystem.py
 
 - Python 3.7+ (no external dependencies — uses only stdlib)
 
+## Known Issues (Resolved)
+
+The following bugs were identified during Phase 3 bug hunting and have been fixed:
+
+1. **`lerp_color` rounding error** — Used `int()` (truncation) instead of `round()` for color interpolation, causing `lerp_color("#000000", "#ffffff", 0.5)` to return `#7f7f7f` instead of `#808080`. Fixed by switching to `round()`.
+
+2. **SVG title XSS/malformed XML** — SVG `<title>` and `<desc>` elements contained unescaped XML special characters (`<`, `>`, `&`), which could produce malformed SVG or allow XSS in browser contexts. Fixed by adding `_escape_xml()` helper that escapes `&`, `<`, `>`, `"`, and `'`.
+
+3. **SVG path grouping lost width variation** — When grouping segments by color for compact SVG output, all segments in a group were rendered with the first segment's `stroke-width`, losing width variation within same-colored segments. Fixed by grouping by `(color, rounded_width)` tuple instead of just `color`.
+
+4. **`iterate_steps` missing validation** — The `iterate_steps()` method did not validate negative iterations, unlike `iterate()`. Fixed by adding the same `ValueError` check for `n < 0`.
+
+5. **CLI `--render-all` required preset** — The `--render-all` flag required `--preset` or `--axiom` to be specified, defeating the purpose of rendering all presets. Fixed by moving the `--render-all` handler before the definition resolution logic.
+
+6. **ASCII output path for extensionless filenames** — When the output filename had no extension (e.g., `output`), the ASCII backend would produce incorrect paths. Fixed by checking for dots in the basename before replacing extensions.
+
+7. **Duplicate iteration validation** — `iterate_steps()` had a duplicated `if n < 0` check after the fix. Removed the duplicate.
+
+## Testing
+
+Run the test suite:
+
+```bash
+python3 -m pytest test_lsystem.py -v
+```
+
+71 tests covering:
+- Color utilities (hex_to_rgb, lerp_color, hsl_to_rgb, rainbow_color)
+- L-system rule serialization/deserialization
+- L-system definition JSON round-trips
+- String rewriting engine (deterministic, stochastic, context-sensitive)
+- Turtle interpreter (drawing, turning, branching, perturbation)
+- Color post-processing (depth, position gradient, rainbow, single)
+- SVG and ASCII rendering
+- High-level renderer API
+- All 14 presets (SVG and ASCII)
+- Edge cases (empty axiom, deep nesting, zero angle, extra pops)
+- Bug verification tests for all fixed issues
+
 ## License
 
 MIT
