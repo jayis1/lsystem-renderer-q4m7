@@ -25,7 +25,10 @@ from .presets import PRESETS
 from ..renderers.svg import SVGRenderer
 from ..renderers.ascii import ASCIIRenderer
 from ..renderers.png import PNGRenderer
+from ..renderers.pdf import PDFRenderer
+from ..renderers.grid import GridRenderer
 from ..core.config import LSystemConfig
+from ..utils.svg_optimizer import optimize_svg, merge_svg_paths
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +162,15 @@ class LSystemRenderer:
                 margin=margin,
             )
             return png_renderer.render(segments, output)
+        elif backend == RenderBackend.PDF:
+            pdf_renderer = PDFRenderer(
+                width=width,
+                height=height,
+                background=definition.background,
+                margin=margin,
+                title=definition.name,
+            )
+            return pdf_renderer.render(segments, output)
         elif backend == RenderBackend.TERMINAL:
             renderer = ASCIIRenderer(width=80, height=40)
             result = renderer.render(segments)
@@ -255,6 +267,123 @@ class LSystemRenderer:
 
         logger.info("Generated %d growth step files", len(paths))
         return paths
+
+    def render_gallery_grid(
+        self,
+        output_path: str = "gallery.svg",
+        iterations: int = 2,
+        cell_width: int = 300,
+        cell_height: int = 300,
+        columns: int = 4,
+        seed: Optional[int] = None,
+    ) -> str:
+        """Render all presets as a tiled grid in a single SVG.
+
+        Args:
+            output_path: Path to write the output SVG file.
+            iterations: Number of iterations per preset.
+            cell_width: Width of each cell in pixels.
+            cell_height: Height of each cell in pixels.
+            columns: Number of columns in the grid.
+            seed: Random seed for stochastic L-systems.
+
+        Returns:
+            Path to the output file.
+        """
+        import copy
+        definitions = {name: copy.deepcopy(defn) for name, defn in PRESETS.items()}
+        grid = GridRenderer(
+            cell_width=cell_width,
+            cell_height=cell_height,
+            columns=columns,
+        )
+        return grid.render_grid(definitions, output_path, iterations=iterations, seed=seed)
+
+    def render_optimized(
+        self,
+        preset_or_definition: Union[str, LSystemDefinition],
+        iterations: Optional[int] = None,
+        output: str = "output.svg",
+        width: int = 800,
+        height: int = 800,
+        background: Optional[str] = None,
+        margin: float = 20.0,
+    ) -> str:
+        """Render an L-system to an optimized (smaller) SVG file.
+
+        Like render() but applies SVG optimization (whitespace removal,
+        float truncation, path merging) to reduce file size.
+
+        Args:
+            preset_or_definition: Preset name or LSystemDefinition.
+            iterations: Override default iteration count.
+            output: Output file path.
+            width: Canvas width.
+            height: Canvas height.
+            background: Background color override.
+            margin: Margin around the drawing.
+
+        Returns:
+            Path to the output file.
+        """
+        # Resolve definition
+        if isinstance(preset_or_definition, str):
+            if preset_or_definition not in PRESETS:
+                available = ", ".join(sorted(PRESETS.keys()))
+                raise ValueError(
+                    f"Unknown preset '{preset_or_definition}'. "
+                    f"Available presets: {available}"
+                )
+            definition = copy.deepcopy(PRESETS[preset_or_definition])
+        else:
+            definition = copy.deepcopy(preset_or_definition)
+
+        if background is not None:
+            definition.background = background
+
+        # Generate and interpret
+        engine = LSystemEngine(definition, seed=self.seed)
+        lstring = engine.iterate(iterations)
+
+        interpreter = TurtleInterpreter(
+            angle=definition.angle,
+            step_size=definition.step_size,
+            line_width=definition.line_width,
+            colors=definition.colors,
+            perturbation=definition.perturbation,
+            step_perturbation=definition.step_perturbation,
+            seed=self.seed,
+        )
+        segments = interpreter.interpret(lstring)
+        segments = ColorPostProcessor.apply(
+            segments,
+            color_mode=definition.color_mode,
+            colors=definition.colors,
+            gradient=definition.gradient,
+        )
+
+        # Render to SVG string, then optimize
+        svg_renderer = SVGRenderer(
+            width=width,
+            height=height,
+            background=definition.background,
+            margin=margin,
+            title=definition.name,
+        )
+
+        # Render to file, then read back, optimize, and rewrite
+        svg_renderer.render(segments, output)
+        with open(output, "r") as f:
+            svg_content = f.read()
+
+        optimized = optimize_svg(svg_content, precision=2)
+        optimized = merge_svg_paths(optimized)
+
+        with open(output, "w") as f:
+            f.write(optimized)
+
+        logger.info("Optimized SVG written to %s", output)
+        return output
 
     def list_presets(self) -> List[str]:
         """Return a list of available preset names."""

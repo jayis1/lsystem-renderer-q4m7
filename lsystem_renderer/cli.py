@@ -107,7 +107,7 @@ Examples:
     # Rendering options
     parser.add_argument(
         "--backend", "-b",
-        choices=["svg", "ascii", "terminal", "png"],
+        choices=["svg", "ascii", "terminal", "png", "pdf"],
         default="svg",
         help="Rendering backend (default: svg)",
     )
@@ -211,6 +211,33 @@ Examples:
         action="store_true",
         help="Print string statistics without rendering",
     )
+    parser.add_argument(
+        "--info",
+        action="store_true",
+        help="Print detailed info about a preset",
+    )
+    parser.add_argument(
+        "--optimize",
+        action="store_true",
+        help="Optimize SVG output (reduce file size)",
+    )
+    parser.add_argument(
+        "--gallery",
+        action="store_true",
+        help="Render all presets as a tiled grid gallery SVG",
+    )
+    parser.add_argument(
+        "--gallery-cols",
+        type=int,
+        default=4,
+        help="Number of columns for --gallery (default: 4)",
+    )
+    parser.add_argument(
+        "--gallery-cell-size",
+        type=int,
+        default=300,
+        help="Cell size in pixels for --gallery (default: 300)",
+    )
 
     # Logging
     parser.add_argument(
@@ -237,6 +264,62 @@ def main(argv: Optional[List[str]] = None) -> None:
         for name in sorted(renderer.list_presets()):
             preset = PRESETS[name]
             print(f"  {name:25s} — {preset.name}")
+        return
+
+    # Gallery mode
+    if args.gallery:
+        from .renderers.grid import GridRenderer
+        import copy
+        output_path = os.path.join(args.directory, "gallery.svg")
+        os.makedirs(args.directory, exist_ok=True)
+        result = renderer.render_gallery_grid(
+            output_path=output_path,
+            iterations=args.iterations or 2,
+            cell_width=args.gallery_cell_size,
+            cell_height=args.gallery_cell_size,
+            columns=args.gallery_cols,
+            seed=args.seed,
+        )
+        print(f"Gallery written to: {result}")
+        return
+
+    # Preset info
+    if args.info:
+        if not args.preset:
+            parser.error("--info requires --preset")
+        preset = renderer.get_preset(args.preset)
+        print(f"Preset: {args.preset}")
+        print(f"  Name: {preset.name}")
+        print(f"  Axiom: {preset.axiom}")
+        print(f"  Rules: {len(preset.rules)}")
+        for r in preset.rules:
+            rule_str = f"  {r.predecessor} -> {r.successor}"
+            extras = []
+            if r.probability != 1.0:
+                extras.append(f"p={r.probability}")
+            if r.condition:
+                extras.append(f"cond={r.condition}")
+            if r.left_context:
+                extras.append(f"left={r.left_context}")
+            if r.right_context:
+                extras.append(f"right={r.right_context}")
+            if extras:
+                rule_str += f" [{', '.join(extras)}]"
+            print(rule_str)
+        print(f"  Angle: {preset.angle}°")
+        print(f"  Step size: {preset.step_size}")
+        print(f"  Default iterations: {preset.iterations}")
+        print(f"  Line width: {preset.line_width}")
+        print(f"  Color mode: {preset.color_mode}")
+        if preset.colors:
+            print(f"  Colors: {preset.colors}")
+        if preset.gradient:
+            print(f"  Gradient: {preset.gradient}")
+        if preset.perturbation:
+            print(f"  Perturbation: {preset.perturbation}°")
+        if preset.step_perturbation:
+            print(f"  Step perturbation: {preset.step_perturbation}")
+        print(f"  Background: {preset.background}")
         return
 
     # Render all presets — no definition needed
@@ -361,18 +444,30 @@ def main(argv: Optional[List[str]] = None) -> None:
         output += ".svg"
     elif args.backend == "png" and not output.endswith(".png"):
         output += ".png"
+    elif args.backend == "pdf" and not output.endswith(".pdf"):
+        output += ".pdf"
 
     try:
-        result = renderer.render(
-            definition,
-            iterations=args.iterations,
-            backend=args.backend,
-            output=output,
-            width=args.width,
-            height=args.height,
-            background=args.background,
-            animate=args.animate,
-        )
+        if args.optimize and args.backend == "svg":
+            result = renderer.render_optimized(
+                definition,
+                iterations=args.iterations,
+                output=output,
+                width=args.width,
+                height=args.height,
+                background=args.background,
+            )
+        else:
+            result = renderer.render(
+                definition,
+                iterations=args.iterations,
+                backend=args.backend,
+                output=output,
+                width=args.width,
+                height=args.height,
+                background=args.background,
+                animate=args.animate,
+            )
         print(f"Output written to: {result}")
 
         # Print brief stats

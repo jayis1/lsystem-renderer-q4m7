@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lsystem-renderer-q4m7"
-version = "2.0.0"
+version = "3.0.0"
 description = "A formal grammar-based generative art engine implementing Lindenmayer Systems"
 readme = "README.md"
 license = {text = "MIT"}
@@ -12,11 +12,12 @@ requires-python = ">=3.8"
 authors = [
     {name = "lsystem-renderer contributors"},
 ]
-keywords = ["l-system", "fractal", "generative-art", "turtle-graphics", "svg", "plant-modeling"]
+keywords = ["l-system", "fractal", "generative-art", "turtle-graphics", "svg", "plant-modeling", "pdf", "renderer"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -24,13 +25,16 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Artistic Software",
     "Topic :: Multimedia :: Graphics",
     "Topic :: Scientific/Engineering :: Artificial Life",
+    "Topic :: Scientific/Engineering :: Visualization",
 ]
 
 [project.optional-dependencies]
 png = ["Pillow>=9.0"]
+pdf = ["reportlab>=4.0"]
 yaml = ["PyYAML>=6.0"]
 toml = ["tomli>=2.0; python_version < '3.11'"]
 dev = [
@@ -38,10 +42,12 @@ dev = [
     "pytest-cov>=4.0",
     "Pillow>=9.0",
     "PyYAML>=6.0",
+    "reportlab>=4.0",
 ]
 all = [
     "Pillow>=9.0",
     "PyYAML>=6.0",
+    "reportlab>=4.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
 
@@ -59,8 +65,7 @@ include = ["lsystem_renderer*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-python_classes = ["Test*"
-]
+python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
 

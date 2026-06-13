@@ -16,6 +16,7 @@ class RenderBackend(Enum):
     ASCII = auto()
     TERMINAL = auto()
     PNG = auto()
+    PDF = auto()
 
 
 class ColorMode(Enum):
