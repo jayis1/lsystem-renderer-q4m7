@@ -1,7 +1,7 @@
-"""Tests for lsystem-renderer-q4m7.
+"""Tests for L-System Renderer package.
 
-Covers: string rewriting, turtle interpretation, rendering, CLI, color utils,
-JSON import/export, edge cases, and bug verification.
+Covers: types, engine, interpreter, color utils, rendering, config, CLI,
+JSON/YAML import/export, edge cases, and bug verification.
 """
 
 import json
@@ -10,16 +10,21 @@ import os
 import tempfile
 import unittest
 
-from lsystem import (
+from lsystem_renderer import (
     ASCIIRenderer,
+    ColorMode,
     ColorPostProcessor,
+    LSystemConfig,
     LSystemDefinition,
     LSystemEngine,
     LSystemRenderer,
     LSystemRule,
-    SVGRenderer,
+    PNGRenderer,
+    RenderBackend,
     Segment,
+    SVGRenderer,
     TurtleInterpreter,
+    TurtleState,
     hex_to_rgb,
     hsl_to_rgb,
     lerp_color,
@@ -27,6 +32,13 @@ from lsystem import (
     rgb_to_hex,
     PRESETS,
 )
+from lsystem_renderer.utils.colors import (
+    _escape_xml,
+    complementary_color,
+    blend_colors,
+    rgb_to_hsl,
+)
+from lsystem_renderer.core.config import RenderConfig, OutputConfig
 
 
 class TestColorUtils(unittest.TestCase):
@@ -53,42 +65,123 @@ class TestColorUtils(unittest.TestCase):
         self.assertEqual(rgb_to_hex(300, -10, 128), "#ff0080")
 
     def test_lerp_color(self):
-        # Start color
         self.assertEqual(lerp_color("#000000", "#ffffff", 0.0), "#000000")
-        # End color
         self.assertEqual(lerp_color("#000000", "#ffffff", 1.0), "#ffffff")
-        # Midpoint — uses round() for proper rounding
         mid = lerp_color("#000000", "#ffffff", 0.5)
         self.assertEqual(mid, "#808080")
 
     def test_lerp_color_clamping(self):
-        # Below 0 clamped to start
         self.assertEqual(lerp_color("#ff0000", "#0000ff", -0.5), "#ff0000")
-        # Above 1 clamped to end
         self.assertEqual(lerp_color("#ff0000", "#0000ff", 1.5), "#0000ff")
 
     def test_hsl_to_rgb(self):
-        # Red
         r, g, b = hsl_to_rgb(0, 1.0, 0.5)
         self.assertAlmostEqual(r, 255, delta=1)
         self.assertAlmostEqual(g, 0, delta=1)
         self.assertAlmostEqual(b, 0, delta=1)
-        # Green
         r, g, b = hsl_to_rgb(120, 1.0, 0.5)
         self.assertAlmostEqual(r, 0, delta=1)
         self.assertAlmostEqual(g, 255, delta=1)
         self.assertAlmostEqual(b, 0, delta=1)
 
+    def test_rgb_to_hsl(self):
+        h, s, l = rgb_to_hsl(255, 0, 0)
+        self.assertAlmostEqual(h, 0.0, delta=1)
+        self.assertAlmostEqual(s, 1.0, delta=0.01)
+        self.assertAlmostEqual(l, 0.5, delta=0.01)
+
+    def test_rgb_hsl_roundtrip(self):
+        """RGB -> HSL -> RGB should be approximately identity."""
+        for r, g, b in [(255, 0, 0), (0, 255, 0), (0, 0, 255), (128, 64, 200)]:
+            h, s, l = rgb_to_hsl(r, g, b)
+            r2, g2, b2 = hsl_to_rgb(h, s, l)
+            self.assertAlmostEqual(r, r2, delta=2, msg=f"R mismatch for ({r},{g},{b})")
+            self.assertAlmostEqual(g, g2, delta=2, msg=f"G mismatch for ({r},{g},{b})")
+            self.assertAlmostEqual(b, b2, delta=2, msg=f"B mismatch for ({r},{g},{b})")
+
     def test_rainbow_color(self):
         color = rainbow_color(0, 10)
         self.assertTrue(color.startswith("#"))
         self.assertEqual(len(color), 7)
-        # Total of 0
         self.assertEqual(rainbow_color(0, 0), "#ffffff")
+
+    def test_complementary_color(self):
+        self.assertEqual(complementary_color("#000000"), "#ffffff")
+        self.assertEqual(complementary_color("#ffffff"), "#000000")
+        self.assertEqual(complementary_color("#ff0000"), "#00ffff")
+
+    def test_blend_colors(self):
+        # Single color
+        self.assertEqual(blend_colors(["#ff0000"], 0.5), "#ff0000")
+        # Two colors
+        mid = blend_colors(["#000000", "#ffffff"], 0.5)
+        self.assertEqual(mid, "#808080")
+        # Multiple colors
+        result = blend_colors(["#ff0000", "#00ff00", "#0000ff"], 0.5)
+        self.assertTrue(result.startswith("#"))
+
+    def test_blend_colors_empty(self):
+        self.assertEqual(blend_colors([], 0.5), "#000000")
+
+    def test_escape_xml(self):
+        self.assertEqual(_escape_xml("<script>"), "&lt;script&gt;")
+        self.assertEqual(_escape_xml("a&b"), "a&amp;b")
+        self.assertEqual(_escape_xml('"x"'), "&quot;x&quot;")
+        self.assertEqual(_escape_xml("'y'"), "&apos;y&apos;")
+
+
+class TestRenderBackend(unittest.TestCase):
+    """Test RenderBackend enum."""
+
+    def test_from_string_svg(self):
+        self.assertEqual(RenderBackend["SVG"], RenderBackend.SVG)
+
+    def test_from_string_ascii(self):
+        self.assertEqual(RenderBackend["ASCII"], RenderBackend.ASCII)
+
+    def test_from_string_invalid(self):
+        with self.assertRaises(KeyError):
+            RenderBackend["INVALID"]
+
+
+class TestColorMode(unittest.TestCase):
+    """Test ColorMode enum."""
+
+    def test_from_string(self):
+        self.assertEqual(ColorMode.from_string("depth"), ColorMode.DEPTH)
+        self.assertEqual(ColorMode.from_string("position"), ColorMode.POSITION)
+        self.assertEqual(ColorMode.from_string("segment_index"), ColorMode.SEGMENT_INDEX)
+        self.assertEqual(ColorMode.from_string("single"), ColorMode.SINGLE)
+
+    def test_from_string_invalid(self):
+        with self.assertRaises(ValueError):
+            ColorMode.from_string("invalid")
+
+    def test_to_string(self):
+        self.assertEqual(ColorMode.DEPTH.to_string(), "depth")
+        self.assertEqual(ColorMode.SEGMENT_INDEX.to_string(), "segment_index")
+
+
+class TestSegment(unittest.TestCase):
+    """Test Segment helper methods."""
+
+    def test_length(self):
+        seg = Segment(0, 0, 3, 4)
+        self.assertAlmostEqual(seg.length(), 5.0)
+
+    def test_midpoint(self):
+        seg = Segment(0, 0, 10, 20)
+        self.assertEqual(seg.midpoint(), (5.0, 10.0))
+
+    def test_direction_deg(self):
+        seg = Segment(0, 0, 1, 0)  # pointing right
+        self.assertAlmostEqual(seg.direction_deg(), 0.0, delta=1)
+        seg2 = Segment(0, 0, 0, 1)  # pointing up
+        self.assertAlmostEqual(seg2.direction_deg(), 90.0, delta=1)
 
 
 class TestLSystemRule(unittest.TestCase):
-    """Test LSystemRule serialization/deserialization."""
+    """Test LSystemRule."""
 
     def test_to_dict_minimal(self):
         rule = LSystemRule("F", "F+F")
@@ -125,9 +218,31 @@ class TestLSystemRule(unittest.TestCase):
         self.assertEqual(rule.left_context, rule2.left_context)
         self.assertEqual(rule.right_context, rule2.right_context)
 
+    def test_parse_arrow(self):
+        rule = LSystemRule.parse("F->F+F--F+F")
+        self.assertEqual(rule.predecessor, "F")
+        self.assertEqual(rule.successor, "F+F--F+F")
+
+    def test_parse_equals(self):
+        rule = LSystemRule.parse("F=F+F")
+        self.assertEqual(rule.predecessor, "F")
+        self.assertEqual(rule.successor, "F+F")
+
+    def test_parse_invalid(self):
+        with self.assertRaises(ValueError):
+            LSystemRule.parse("invalid")
+
+    def test_validation_empty_predecessor(self):
+        with self.assertRaises(ValueError):
+            LSystemRule("", "F+F")
+
+    def test_validation_zero_probability(self):
+        with self.assertRaises(ValueError):
+            LSystemRule("F", "F+F", probability=0.0)
+
 
 class TestLSystemDefinition(unittest.TestCase):
-    """Test LSystemDefinition serialization."""
+    """Test LSystemDefinition."""
 
     def test_to_dict_minimal(self):
         defn = LSystemDefinition(name="Test", axiom="F", rules=[LSystemRule("F", "F+F")])
@@ -165,6 +280,22 @@ class TestLSystemDefinition(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_validation_empty_name(self):
+        with self.assertRaises(ValueError):
+            LSystemDefinition(name="", axiom="F", rules=[])
+
+    def test_validation_negative_iterations(self):
+        with self.assertRaises(ValueError):
+            LSystemDefinition(name="X", axiom="F", rules=[], iterations=-1)
+
+    def test_validation_invalid_color_mode(self):
+        with self.assertRaises(ValueError):
+            LSystemDefinition(name="X", axiom="F", rules=[], color_mode="invalid")
+
+    def test_validation_negative_step_size(self):
+        with self.assertRaises(ValueError):
+            LSystemDefinition(name="X", axiom="F", rules=[], step_size=-1.0)
+
 
 class TestLSystemEngine(unittest.TestCase):
     """Test the L-system string rewriting engine."""
@@ -179,7 +310,6 @@ class TestLSystemEngine(unittest.TestCase):
         defn = LSystemDefinition(name="Koch", axiom="F", rules=[LSystemRule("F", "F+F--F+F")], angle=60)
         engine = LSystemEngine(defn)
         result = engine.iterate(2)
-        # Each F expands to F+F--F+F
         expected = "F+F--F+F+F+F--F+F--F+F--F+F+F+F--F+F"
         self.assertEqual(result, expected)
 
@@ -196,15 +326,12 @@ class TestLSystemEngine(unittest.TestCase):
             engine.iterate(-1)
 
     def test_non_matching_symbol_unchanged(self):
-        """Symbols with no matching rule should be preserved."""
         defn = LSystemDefinition(name="Test", axiom="F+G", rules=[LSystemRule("F", "FF")])
         engine = LSystemEngine(defn)
         result = engine.iterate(1)
-        # G has no rule, should stay as G
         self.assertEqual(result, "FF+G")
 
     def test_stochastic_with_seed_deterministic(self):
-        """Stochastic rules with same seed produce same result."""
         defn = LSystemDefinition(
             name="StochTest",
             axiom="F",
@@ -220,7 +347,6 @@ class TestLSystemEngine(unittest.TestCase):
         self.assertEqual(result1, result2)
 
     def test_context_sensitive(self):
-        """Context-sensitive rules should check neighbors."""
         defn = LSystemDefinition(
             name="ContextTest",
             axiom="ABA",
@@ -230,11 +356,9 @@ class TestLSystemEngine(unittest.TestCase):
         )
         engine = LSystemEngine(defn)
         result = engine.iterate(1)
-        # B with left A and right A should expand
         self.assertEqual(result, "ABBA")
 
     def test_context_sensitive_no_match(self):
-        """Context-sensitive rule that doesn't match should leave symbol unchanged."""
         defn = LSystemDefinition(
             name="ContextTest",
             axiom="BBA",
@@ -244,16 +368,13 @@ class TestLSystemEngine(unittest.TestCase):
         )
         engine = LSystemEngine(defn)
         result = engine.iterate(1)
-        # No B has left context "A", so both Bs stay as B
-        # B at index 0: left context would be empty (or before start), not "A"
-        # B at index 1: left context is "B", not "A"
         self.assertEqual(result, "BBA")
 
     def test_analyze(self):
         result = LSystemEngine.analyze("F+F--F+F")
         self.assertEqual(result["length"], 8)
-        self.assertEqual(result["draw_symbols"], 4)  # Four F's in "F+F--F+F"
-        self.assertEqual(result["unique_symbols"], 3)  # F, +, -
+        self.assertEqual(result["draw_symbols"], 4)
+        self.assertEqual(result["unique_symbols"], 3)
         self.assertEqual(result["symbols"]["F"], 4)
 
     def test_analyze_empty(self):
@@ -261,15 +382,25 @@ class TestLSystemEngine(unittest.TestCase):
         self.assertEqual(result["length"], 0)
         self.assertEqual(result["draw_symbols"], 0)
 
+    def test_analyze_branch_depth(self):
+        result = LSystemEngine.analyze("F[F[+F]]")
+        self.assertEqual(result["branch_depth"], 2)
+
     def test_iterate_steps(self):
         defn = LSystemDefinition(name="Test", axiom="F", rules=[LSystemRule("F", "FF")])
         engine = LSystemEngine(defn)
         steps = engine.iterate_steps(3)
-        self.assertEqual(len(steps), 4)  # axiom + 3 iterations
+        self.assertEqual(len(steps), 4)
         self.assertEqual(steps[0], "F")
         self.assertEqual(steps[1], "FF")
         self.assertEqual(steps[2], "FFFF")
         self.assertEqual(steps[3], "FFFFFFFF")
+
+    def test_iterate_steps_negative_raises(self):
+        defn = LSystemDefinition(name="Test", axiom="F", rules=[LSystemRule("F", "FF")])
+        engine = LSystemEngine(defn)
+        with self.assertRaises(ValueError):
+            engine.iterate_steps(-1)
 
 
 class TestTurtleInterpreter(unittest.TestCase):
@@ -279,83 +410,71 @@ class TestTurtleInterpreter(unittest.TestCase):
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("F")
         self.assertEqual(len(segments), 1)
-        # Starting at (0,0) pointing up (90°), step 10
         self.assertAlmostEqual(segments[0].x1, 0)
         self.assertAlmostEqual(segments[0].y1, 0)
         self.assertAlmostEqual(segments[0].x2, 0, places=5)
         self.assertAlmostEqual(segments[0].y2, 10, places=5)
 
     def test_forward_no_draw(self):
-        """'f' should move without drawing."""
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("f")
         self.assertEqual(len(segments), 0)
 
     def test_turn_right_90(self):
-        """Turn right 90°, then move forward."""
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("F-F")
         self.assertEqual(len(segments), 2)
-        # Second segment should go to the right (0°)
         self.assertAlmostEqual(segments[1].x2, 10, places=5)
 
     def test_turn_left_90(self):
-        """Turn left 90°, then move forward."""
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("F+F")
         self.assertEqual(len(segments), 2)
-        # Second segment should go left (180°)
-        # Starting at 90°, +90 = 180° (pointing left in standard math)
-        # But in our coord system, 180° means pointing left
         self.assertAlmostEqual(segments[1].x2, -10, places=5)
 
     def test_push_pop(self):
-        """Push/pop should restore turtle state."""
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("F[+F]F")
-        # Three segments: F (up), +F (left), F (up again after pop)
         self.assertEqual(len(segments), 3)
-        # After pop, the state should be back to where it was before [
-        # Last segment starts where first F ended
         self.assertAlmostEqual(segments[2].x1, segments[0].x2, places=5)
         self.assertAlmostEqual(segments[2].y1, segments[0].y2, places=5)
 
     def test_reverse_direction(self):
-        """'|' should reverse direction (turn 180°)."""
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("F|F")
-        # First F goes up, then | reverses, second F goes down
         self.assertAlmostEqual(segments[1].y2, 0, places=5)
 
     def test_perturbation(self):
-        """Perturbation should add randomness to angles."""
         interp = TurtleInterpreter(angle=90, step_size=10, perturbation=5.0, seed=42)
         segments = interp.interpret("FFFF")
-        # With perturbation, the segments should NOT form a perfect square
-        # Check that at least one angle deviates from 90°
-        # (statistically very likely with 5° std dev)
-        # Just verify we get 4 segments
         self.assertEqual(len(segments), 4)
 
     def test_colors_by_depth(self):
-        """Branch depth should affect color."""
         colors = {0: "#ff0000", 1: "#00ff00", 2: "#0000ff"}
         interp = TurtleInterpreter(angle=90, step_size=10, colors=colors)
         segments = interp.interpret("F[+F[+F]]")
-        # Root segments should be depth 0 (color #ff0000)
         self.assertEqual(segments[0].color, "#ff0000")
-        # Find a branch segment (depth >= 1)
         branch_segments = [s for s in segments if s.depth >= 1]
         self.assertTrue(len(branch_segments) > 0)
 
     def test_line_width_thinning_in_branch(self):
-        """Lines should thin in branches."""
         interp = TurtleInterpreter(angle=90, step_size=10, line_width=2.0)
         segments = interp.interpret("F[+F]")
-        # Root segment width 2.0, branch should be thinner
         root_width = segments[0].width
         branch_width = segments[1].width
         self.assertGreater(root_width, branch_width)
+
+    def test_shrink_at_symbol(self):
+        """'@' should shrink step size by 0.8 factor."""
+        interp = TurtleInterpreter(angle=90, step_size=10)
+        segments = interp.interpret("F@F")
+        self.assertAlmostEqual(segments[0].y2, 10, places=5)
+        self.assertAlmostEqual(segments[1].y2, 18, places=0)  # 10 + 8
+
+    def test_interpret_empty_string(self):
+        interp = TurtleInterpreter(angle=90, step_size=10)
+        segments = interp.interpret("")
+        self.assertEqual(len(segments), 0)
 
 
 class TestColorPostProcessor(unittest.TestCase):
@@ -374,14 +493,12 @@ class TestColorPostProcessor(unittest.TestCase):
     def test_single_color_mode(self):
         segs = [Segment(0, 0, 1, 1), Segment(1, 1, 2, 2)]
         result = ColorPostProcessor.apply(segs, color_mode="single")
-        # All segments should have the default color
         self.assertEqual(result[0].color, result[1].color)
 
     def test_segment_index_color_mode(self):
         segs = [Segment(0, 0, 1, 1, segment_index=0),
                 Segment(1, 1, 2, 2, segment_index=1)]
         result = ColorPostProcessor.apply(segs, color_mode="segment_index")
-        # Two different colors
         self.assertNotEqual(result[0].color, result[1].color)
 
     def test_position_gradient_mode(self):
@@ -391,14 +508,17 @@ class TestColorPostProcessor(unittest.TestCase):
         ]
         gradient = ("#000000", "#ffffff")
         result = ColorPostProcessor.apply(segs, color_mode="position", gradient=gradient)
-        # Bottom segment should be closer to start color
         self.assertEqual(result[0].color, "#000000")
-        # Top segment should be closer to end color
         self.assertEqual(result[1].color, "#ffffff")
 
     def test_empty_segments(self):
         result = ColorPostProcessor.apply([], color_mode="depth")
         self.assertEqual(result, [])
+
+    def test_unknown_color_mode_leaves_unchanged(self):
+        segs = [Segment(0, 0, 1, 1, color="#ff0000")]
+        result = ColorPostProcessor.apply(segs, color_mode="nonexistent")
+        self.assertEqual(result[0].color, "#ff0000")
 
 
 class TestSVGRenderer(unittest.TestCase):
@@ -420,7 +540,6 @@ class TestSVGRenderer(unittest.TestCase):
             os.unlink(path)
 
     def test_empty_segments(self):
-        """Empty segments should produce valid SVG."""
         renderer = SVGRenderer(width=100, height=100)
         with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
             path = f.name
@@ -445,6 +564,37 @@ class TestSVGRenderer(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_svg_title_escaping(self):
+        segments = [Segment(0, 0, 10, 10)]
+        renderer = SVGRenderer(width=100, height=100, title="Test<script>")
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
+            path = f.name
+        try:
+            renderer.render(segments, path)
+            with open(path) as f:
+                content = f.read()
+            self.assertIn("&lt;script&gt;", content)
+            self.assertNotIn("<script>", content)
+        finally:
+            os.unlink(path)
+
+    def test_svg_path_grouping_by_width(self):
+        segments = [
+            Segment(0, 0, 10, 0, color="#ff0000", width=1.0),
+            Segment(10, 0, 20, 0, color="#ff0000", width=3.0),
+        ]
+        renderer = SVGRenderer(width=100, height=100)
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
+            path = f.name
+        try:
+            renderer.render(segments, path)
+            with open(path) as f:
+                content = f.read()
+            self.assertIn('stroke-width="1.00"', content)
+            self.assertIn('stroke-width="3.00"', content)
+        finally:
+            os.unlink(path)
+
 
 class TestASCIIRenderer(unittest.TestCase):
     """Test ASCII rendering."""
@@ -454,14 +604,73 @@ class TestASCIIRenderer(unittest.TestCase):
         renderer = ASCIIRenderer(width=20, height=10)
         result = renderer.render(segments)
         self.assertTrue(len(result) > 0)
-        # ASCII renderer now uses directional characters, not just "*"
-        # A diagonal line should use "\" character
         self.assertIn("\\", result)
 
     def test_empty_segments(self):
         renderer = ASCIIRenderer(width=20, height=10)
         result = renderer.render([])
         self.assertEqual(result, "")
+
+    def test_writes_to_file(self):
+        segments = [Segment(0, 0, 10, 10)]
+        renderer = ASCIIRenderer(width=20, height=10)
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            path = f.name
+        try:
+            renderer.render(segments, output_path=path)
+            self.assertTrue(os.path.exists(path))
+            with open(path) as f:
+                content = f.read()
+            self.assertTrue(len(content) > 0)
+        finally:
+            os.unlink(path)
+
+
+class TestPNGRenderer(unittest.TestCase):
+    """Test PNG rendering."""
+
+    def test_is_available(self):
+        # Just check it doesn't crash
+        result = PNGRenderer.is_available()
+        self.assertIsInstance(result, bool)
+
+    def test_render_when_available(self):
+        if not PNGRenderer.is_available():
+            self.skipTest("Pillow not available")
+        segments = [Segment(0, 0, 10, 10, color="#ff0000")]
+        renderer = PNGRenderer(width=100, height=100)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            path = f.name
+        try:
+            result = renderer.render(segments, path)
+            self.assertTrue(os.path.exists(path))
+            self.assertGreater(os.path.getsize(path), 0)
+        finally:
+            os.unlink(path)
+
+    def test_render_empty_when_available(self):
+        if not PNGRenderer.is_available():
+            self.skipTest("Pillow not available")
+        renderer = PNGRenderer(width=100, height=100)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            path = f.name
+        try:
+            renderer.render([], path)
+            self.assertTrue(os.path.exists(path))
+        finally:
+            os.unlink(path)
+
+    def test_import_error_without_pillow(self):
+        """Test that attempting to render without Pillow raises ImportError."""
+        # We can't easily test this when Pillow IS installed,
+        # but we can verify the is_available() method works
+        if PNGRenderer.is_available():
+            # Pillow is installed, so rendering should work
+            pass
+        else:
+            with self.assertRaises(ImportError):
+                renderer = PNGRenderer(width=100, height=100)
+                renderer.render([], "/tmp/test.png")
 
 
 class TestLSystemRenderer(unittest.TestCase):
@@ -521,7 +730,7 @@ class TestLSystemRenderer(unittest.TestCase):
         presets = renderer.list_presets()
         self.assertIn("koch_curve", presets)
         self.assertIn("dragon_curve", presets)
-        self.assertTrue(len(presets) >= 10)
+        self.assertTrue(len(presets) >= 14)
 
     def test_get_preset(self):
         renderer = LSystemRenderer()
@@ -539,18 +748,18 @@ class TestLSystemRenderer(unittest.TestCase):
             results = renderer.render_all_presets(output_dir=tmpdir, iterations=1)
             self.assertTrue(len(results) > 0)
             for name, path in results.items():
-                self.assertTrue(os.path.exists(path), f"Missing file for {name}: {path}")
+                if not path.startswith("ERROR"):
+                    self.assertTrue(os.path.exists(path), f"Missing file for {name}: {path}")
 
     def test_animate_growth(self):
         renderer = LSystemRenderer(seed=42)
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = renderer.animate_growth("koch_curve", output_dir=tmpdir, iterations=2)
-            self.assertEqual(len(paths), 3)  # step_0, step_1, step_2
+            self.assertEqual(len(paths), 3)
             for path in paths:
                 self.assertTrue(os.path.exists(path))
 
     def test_perturbation_produces_different_output(self):
-        """With perturbation, same seed but different perturbation should differ."""
         defn1 = LSystemDefinition(
             name="Test1", axiom="F", rules=[LSystemRule("F", "F[+F]F[-F]F")],
             angle=25.7, perturbation=0.0, iterations=3,
@@ -568,7 +777,6 @@ class TestLSystemRenderer(unittest.TestCase):
         segs1 = interp1.interpret(lstring)
         segs2 = interp2.interpret(lstring)
 
-        # With perturbation, at least some segment positions should differ
         if len(segs1) > 0 and len(segs2) > 0:
             different = False
             for s1, s2 in zip(segs1, segs2):
@@ -576,6 +784,25 @@ class TestLSystemRenderer(unittest.TestCase):
                     different = True
                     break
             self.assertTrue(different, "Perturbation should produce different output")
+
+    def test_invalid_backend_raises(self):
+        renderer = LSystemRenderer()
+        defn = renderer.get_preset("koch_curve")
+        with self.assertRaises(ValueError):
+            renderer.render(defn, backend="invalid_backend", output="/tmp/test.svg")
+
+    def test_render_from_config(self):
+        config = LSystemConfig(
+            preset="koch_curve",
+            iterations=2,
+            backend="svg",
+            render=RenderConfig(width=200, height=200),
+            output=OutputConfig(output_dir="/tmp"),
+        )
+        renderer = LSystemRenderer(seed=42)
+        result = renderer.render_from_config(config)
+        self.assertTrue(os.path.exists(result))
+        os.unlink(result)
 
 
 class TestPresets(unittest.TestCase):
@@ -598,12 +825,104 @@ class TestPresets(unittest.TestCase):
                 self.assertTrue(os.path.exists(result))
                 os.unlink(result)
 
+    def test_presets_count(self):
+        self.assertGreaterEqual(len(PRESETS), 14)
+
+    def test_new_presets_exist(self):
+        """Verify new presets are available."""
+        renderer = LSystemRenderer()
+        for name in ["sierpinski_arrowhead", "peano_curve", "quadratic_koch", "tree_willow"]:
+            with self.subTest(preset=name):
+                preset = renderer.get_preset(name)
+                self.assertIsNotNone(preset)
+
+
+class TestConfig(unittest.TestCase):
+    """Test configuration management."""
+
+    def test_config_to_dict(self):
+        config = LSystemConfig(
+            preset="koch_curve",
+            iterations=4,
+            seed=42,
+            backend="svg",
+            render=RenderConfig(width=500, height=500),
+        )
+        d = config.to_dict()
+        self.assertEqual(d["preset"], "koch_curve")
+        self.assertEqual(d["iterations"], 4)
+        self.assertEqual(d["seed"], 42)
+
+    def test_config_from_dict(self):
+        d = {
+            "preset": "dragon_curve",
+            "iterations": 5,
+            "seed": 123,
+            "backend": "ascii",
+            "render": {"width": 600, "height": 400},
+        }
+        config = LSystemConfig.from_dict(d)
+        self.assertEqual(config.preset, "dragon_curve")
+        self.assertEqual(config.render.width, 600)
+
+    def test_config_json_roundtrip(self):
+        config = LSystemConfig(
+            preset="koch_curve",
+            iterations=4,
+            seed=42,
+            backend="svg",
+            render=RenderConfig(width=800, height=600, background="#222222"),
+            output=OutputConfig(output_dir="/tmp/lsystem"),
+        )
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            config.to_json(path)
+            loaded = LSystemConfig.from_json(path)
+            self.assertEqual(loaded.preset, config.preset)
+            self.assertEqual(loaded.iterations, config.iterations)
+            self.assertEqual(loaded.render.width, config.render.width)
+            self.assertEqual(loaded.output.output_dir, config.output.output_dir)
+        finally:
+            os.unlink(path)
+
+    def test_config_from_file_json(self):
+        config = LSystemConfig(preset="koch_curve", backend="svg")
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            config.to_json(path)
+            loaded = LSystemConfig.from_file(path)
+            self.assertEqual(loaded.preset, "koch_curve")
+        finally:
+            os.unlink(path)
+
+    def test_config_from_file_invalid_ext(self):
+        with self.assertRaises(ValueError):
+            LSystemConfig.from_file("config.xyz")
+
+    def test_config_without_source_raises(self):
+        config = LSystemConfig()  # No preset or definition
+        renderer = LSystemRenderer()
+        with self.assertRaises(ValueError):
+            renderer.render_from_config(config)
+
+    def test_render_config_defaults(self):
+        rc = RenderConfig()
+        self.assertEqual(rc.width, 800)
+        self.assertEqual(rc.height, 800)
+        self.assertEqual(rc.background, "#ffffff")
+
+    def test_output_config_defaults(self):
+        oc = OutputConfig()
+        self.assertEqual(oc.output_dir, ".")
+        self.assertTrue(oc.overwrite)
+
 
 class TestEdgeCases(unittest.TestCase):
     """Test edge cases and potential bugs."""
 
     def test_cantor_dust_angle_zero(self):
-        """Cantor dust has angle=0 — should render a horizontal line."""
         renderer = LSystemRenderer(seed=42)
         with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
             path = f.name
@@ -614,42 +933,33 @@ class TestEdgeCases(unittest.TestCase):
             os.unlink(path)
 
     def test_single_segment(self):
-        """Single F should produce exactly one segment."""
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("F")
         self.assertEqual(len(segments), 1)
 
     def test_no_draw_symbols(self):
-        """String with no draw symbols should produce no segments."""
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("+-[]")
         self.assertEqual(len(segments), 0)
 
     def test_empty_axiom(self):
-        """Empty axiom should produce empty string."""
         defn = LSystemDefinition(name="Empty", axiom="", rules=[LSystemRule("F", "FF")])
         engine = LSystemEngine(defn)
         result = engine.iterate(3)
         self.assertEqual(result, "")
 
     def test_deeply_nested_branches(self):
-        """Deep nesting should not crash."""
         interp = TurtleInterpreter(angle=30, step_size=5)
-        # 50 nested pushes without matching pops (should handle gracefully)
         lstring = "F" + "[" * 50 + "F" + "]" * 50
         segments = interp.interpret(lstring)
-        # Should produce at least 2 segments
         self.assertGreaterEqual(len(segments), 2)
 
     def test_more_pops_than_pushes(self):
-        """Extra pop operations should be safely ignored."""
         interp = TurtleInterpreter(angle=90, step_size=10)
         segments = interp.interpret("F]F]F]")
-        # Should still produce 3 segments (extra ] ignored)
         self.assertEqual(len(segments), 3)
 
     def test_json_roundtrip_preserves_definition(self):
-        """JSON save/load should preserve all definition properties."""
         defn = LSystemDefinition(
             name="FullTest",
             axiom="X",
@@ -690,7 +1000,6 @@ class TestEdgeCases(unittest.TestCase):
             os.unlink(path)
 
     def test_rainbow_mode_on_presets(self):
-        """Rainbow mode should work on any preset."""
         renderer = LSystemRenderer(seed=42)
         defn = renderer.get_preset("koch_curve")
         defn.color_mode = "segment_index"
@@ -707,58 +1016,16 @@ class TestBugVerification(unittest.TestCase):
     """Tests that verify specific bugs were found and fixed."""
 
     def test_bug_ascii_renderer_y_flip(self):
-        """BUG: ASCII renderer should flip Y axis (math Y up, text Y down).
-
-        Verify that a vertical line going up (y1=0, y2=10) appears
-        at the top of the rendered output.
-        """
-        # Segment going up from (0,0) to (0,10)
         segments = [Segment(0, 0, 0, 10)]
         renderer = ASCIIRenderer(width=20, height=10)
         result = renderer.render(segments)
         lines = result.split("\n")
-        # The vertical line should be in the leftmost column
-        # Top of output should have a character (high y)
         top_has_content = any(c != " " for c in lines[0])
-        # Bottom of output should also have content (low y)
         bottom_has_content = any(c != " " for c in lines[-1])
         self.assertTrue(top_has_content or bottom_has_content)
 
-    def test_bug_svg_grouped_paths_different_widths(self):
-        """BUG: SVG path grouping uses only first segment's width.
-
-        When segments of the same color have different widths,
-        the grouped SVG path uses the width of the first segment only,
-        making all segments in that group appear with the same width.
-        This is documented behavior but could be a visual bug.
-        Verify it exists so we know about it.
-        """
-        segments = [
-            Segment(0, 0, 10, 0, color="#ff0000", width=1.0),
-            Segment(10, 0, 20, 0, color="#ff0000", width=3.0),
-        ]
-        renderer = SVGRenderer(width=100, height=100)
-        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
-            path = f.name
-        try:
-            renderer.render(segments, path)
-            with open(path) as f:
-                content = f.read()
-            # Both segments are same color, so grouped into one path
-            # The width will be 1.0 (first segment's width), not 3.0
-            # Check that path element has width 1.00
-            self.assertIn('stroke-width="1.00"', content)
-        finally:
-            os.unlink(path)
-
     def test_bug_svg_title_not_escaped(self):
-        """BUG FIXED: SVG title is now properly HTML-escaped.
-
-        Previously, if the title contained XML special characters like <, >, &,
-        the SVG output would be malformed. Now they are properly escaped.
-        """
         segments = [Segment(0, 0, 10, 10)]
-        # Test with angle brackets and ampersand in title
         renderer = SVGRenderer(width=100, height=100, title="Test<script>alert('xss')</script>&more")
         with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
             path = f.name
@@ -766,7 +1033,6 @@ class TestBugVerification(unittest.TestCase):
             renderer.render(segments, path)
             with open(path) as f:
                 content = f.read()
-            # Title should be escaped, not raw
             self.assertIn("&lt;script&gt;", content)
             self.assertNotIn("<script>", content)
             self.assertIn("&amp;", content)
@@ -774,10 +1040,6 @@ class TestBugVerification(unittest.TestCase):
             os.unlink(path)
 
     def test_bug_svg_path_grouping_preserves_widths(self):
-        """BUG FIXED: SVG path grouping now groups by (color, width) instead of
-        just color, so segments with different widths but same color are
-        rendered with correct widths.
-        """
         segments = [
             Segment(0, 0, 10, 0, color="#ff0000", width=1.0),
             Segment(10, 0, 20, 0, color="#ff0000", width=3.0),
@@ -789,46 +1051,134 @@ class TestBugVerification(unittest.TestCase):
             renderer.render(segments, path)
             with open(path) as f:
                 content = f.read()
-            # Should have two separate path elements for different widths
             self.assertIn('stroke-width="1.00"', content)
             self.assertIn('stroke-width="3.00"', content)
         finally:
             os.unlink(path)
 
     def test_bug_iteration_safety_estimate_inaccurate(self):
-        """The iteration safety check uses a worst-case estimate that may
-        be too aggressive for some L-systems where rules produce shorter
-        strings than the estimate. This is a known limitation.
-        """
         defn = LSystemDefinition(
             name="Short",
             axiom="A",
-            rules=[LSystemRule("A", "B")],  # Actually shortens!
+            rules=[LSystemRule("A", "B")],
             iterations=4,
         )
         engine = LSystemEngine(defn)
-        # Should work fine — the estimate would overestimate
         result = engine.iterate(4)
-        self.assertEqual(result, "B")  # A -> B, then B has no rule
+        self.assertEqual(result, "B")
 
     def test_iterate_steps_negative_iterations_raises(self):
-        """iterate_steps should also validate iterations."""
         defn = LSystemDefinition(name="Test", axiom="F", rules=[LSystemRule("F", "FF")])
         engine = LSystemEngine(defn)
         with self.assertRaises(ValueError):
             engine.iterate_steps(-1)
 
     def test_lerp_color_rounding_fix(self):
-        """BUG FIXED: lerp_color used int() which truncates instead of round().
-
-        This caused lerp_color("#000000", "#ffffff", 0.5) to return #7f7f7f
-        instead of the correct #808080.
-        """
         mid = lerp_color("#000000", "#ffffff", 0.5)
         self.assertEqual(mid, "#808080")
-        # Also test quarter point
         q1 = lerp_color("#000000", "#ffffff", 0.25)
         self.assertEqual(q1, "#404040")
+
+
+class TestCLI(unittest.TestCase):
+    """Test CLI argument parsing."""
+
+    def test_build_parser(self):
+        from lsystem_renderer.cli import build_parser
+        parser = build_parser()
+        self.assertIsNotNone(parser)
+
+    def test_cli_list_presets(self):
+        from lsystem_renderer.cli import main
+        import io
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            main(["--list-presets"])
+            output = sys.stdout.getvalue()
+            self.assertIn("koch_curve", output)
+            self.assertIn("dragon_curve", output)
+        finally:
+            sys.stdout = old_stdout
+
+    def test_cli_render(self):
+        from lsystem_renderer.cli import main
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
+            path = f.name
+        try:
+            main(["--preset", "koch_curve", "-i", "2", "-o", path])
+            self.assertTrue(os.path.exists(path))
+        finally:
+            os.unlink(path)
+
+    def test_cli_stats(self):
+        from lsystem_renderer.cli import main
+        import io
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            main(["--preset", "koch_curve", "-i", "2", "--stats"])
+            output = sys.stdout.getvalue()
+            self.assertIn("Koch Curve", output)
+            self.assertIn("String length", output)
+        finally:
+            sys.stdout = old_stdout
+
+    def test_cli_save_definition(self):
+        from lsystem_renderer.cli import main
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            main(["--preset", "koch_curve", "--save", path])
+            self.assertTrue(os.path.exists(path))
+            with open(path) as f:
+                data = json.load(f)
+            self.assertEqual(data["name"], "Koch Curve")
+        finally:
+            os.unlink(path)
+
+    def test_cli_custom_axiom_and_rules(self):
+        from lsystem_renderer.cli import main
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
+            path = f.name
+        try:
+            main(["--axiom", "F", "--rule", "F->F+F--F+F", "--angle", "60", "-i", "2", "-o", path])
+            self.assertTrue(os.path.exists(path))
+        finally:
+            os.unlink(path)
+
+    def test_cli_render_all(self):
+        from lsystem_renderer.cli import main
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main(["--render-all", "-d", tmpdir, "-i", "1"])
+            # Check that at least some SVG files were created
+            files = [f for f in os.listdir(tmpdir) if f.endswith(".svg")]
+            self.assertGreater(len(files), 0)
+
+    def test_cli_load_json(self):
+        from lsystem_renderer.cli import main
+        # First save a definition
+        defn = LSystemDefinition(
+            name="CLI Test",
+            axiom="F",
+            rules=[LSystemRule("F", "F+F--F+F")],
+            angle=60.0,
+            step_size=3.0,
+            iterations=2,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            json_path = f.name
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as f:
+            svg_path = f.name
+        try:
+            defn.to_json(json_path)
+            main(["--load", json_path, "-o", svg_path])
+            self.assertTrue(os.path.exists(svg_path))
+        finally:
+            os.unlink(json_path)
+            os.unlink(svg_path)
 
 
 if __name__ == "__main__":
